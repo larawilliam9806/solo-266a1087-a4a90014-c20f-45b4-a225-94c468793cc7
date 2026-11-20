@@ -10,6 +10,8 @@ from __future__ import annotations
 import csv
 import io
 import os
+import sqlite3
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -31,6 +33,11 @@ from . import layout
 from .csvparse import CsvError, parse_csv
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+# A single suggestion must finish comfortably inside gunicorn's 60s worker
+# timeout.  The algorithm below is O(n**2); this guard only ever trips on
+# pathological inputs and leaves the caller free to fall back / report.
+SUGGEST_DEADLINE_SECONDS = 50.0
 
 
 def create_app(config=None):
@@ -59,7 +66,8 @@ def create_app(config=None):
     @app.teardown_appcontext
     def close_db(_exception=None):
         connection = g.pop("db", None)
-        if connection is not None:
+        # The shared :memory: connection must outlive individual requests.
+        if connection is not None and app.config["DATABASE"] != ":memory:":
             connection.close()
 
     def load_job_or_404(job_id):
@@ -163,11 +171,32 @@ def create_app(config=None):
                 flash(line, "error")
             return redirect(url_for("index"))
 
+        # Compute the proposal before opening any write transaction, so a slow
+        # suggestion never holds a database lock and never blocks other pages
+        # from saving lines or decisions.
+        try:
+            horizontal, vertical = _suggest_lines(parsed.boxes)
+        except SuggestTimeout:
+            flash("文字框数量过多，按文字框提议超时，请改用较小页面或手动划设格线",
+                  "error")
+            return redirect(url_for("index"))
+
         connection = get_db()
-        job_id = db.create_job(connection, filename)
-        db.add_boxes(connection, job_id, parsed.boxes)
-        horizontal, vertical = _suggest_lines(parsed.boxes)
-        db.set_lines(connection, job_id, horizontal, vertical)
+        # One transaction for the whole import: the job row is inserted as
+        # "importing" and only becomes visible in the task list after every
+        # box and the proposed lines have been written.  Any failure (or a
+        # killed worker) rolls the whole thing back, so re-uploading the same
+        # page never sees a half-written job.
+        try:
+            with db.transaction(connection):
+                job_id = db.create_job(connection, filename, commit=False)
+                db.add_boxes(connection, job_id, parsed.boxes, commit=False)
+                db.set_lines(connection, job_id, horizontal, vertical,
+                             commit=False)
+                db.mark_job_ready(connection, job_id, commit=False)
+        except (db.ImportError, sqlite3.Error) as error:
+            flash(f"导入失败，未保存任何内容：{error}", "error")
+            return redirect(url_for("index"))
         for warning in parsed.warnings[:20]:
             flash(warning, "warning")
         flash(f"已导入 {len(parsed.boxes)} 个文字框，请核对格线", "success")
@@ -217,7 +246,14 @@ def create_app(config=None):
     def api_suggest_lines(job_id):
         load_job_or_404(job_id)
         boxes = db.get_boxes(get_db(), job_id)
-        horizontal, vertical = _suggest_lines(boxes)
+        try:
+            horizontal, vertical = _suggest_lines(boxes)
+        except SuggestTimeout:
+            return jsonify({
+                "ok": False,
+                "error": "文字框数量过多，按文字框提议超时，请手动划设格线",
+                "details": [],
+            }), 503
         return jsonify({"ok": True, "horizontal": horizontal, "vertical": vertical})
 
     @app.post("/api/jobs/<int:job_id>/decisions")
@@ -320,22 +356,34 @@ def _quote_filename(name):
     return quote(name)
 
 
-def _suggest_lines(boxes):
+class SuggestTimeout(Exception):
+    """Raised when line suggestion cannot finish inside the request budget."""
+
+
+def _suggest_lines(boxes, deadline=None):
     """Propose ruling lines from the OCR boxes.
 
     Vertical: page borders plus two separators chosen so the boxes cluster
     into three columns (splits are only allowed inside empty horizontal gaps).
     Horizontal: page margins plus a separator between adjacent text bands
     that do not overlap vertically.
+
+    The whole computation is purely in-memory and holds no database lock, so
+    a large page cannot block other jobs from saving lines or decisions.
+    ``deadline`` is an optional perf_counter() wall-clock limit used by the
+    callers that must answer inside the 60s worker timeout.
     """
     if not boxes:
         return [], []
+    if deadline is None:
+        deadline = time.perf_counter() + SUGGEST_DEADLINE_SECONDS
+
     x1 = min(box["x1"] for box in boxes)
     x2 = max(box["x2"] for box in boxes)
     y1 = min(box["y1"] for box in boxes)
     y2 = max(box["y2"] for box in boxes)
 
-    separators = _column_separators(boxes, x1, x2)
+    separators = _column_separators(boxes, x1, x2, deadline)
     vertical = sorted({round(x1, 2), round(x2, 2), *separators})
     if len(vertical) != 4 or x2 - x1 <= layout.EPS:
         # Degenerate page (a single point, or no usable x-spread): propose a
@@ -348,7 +396,9 @@ def _suggest_lines(boxes):
     # Horizontal: group boxes into visual bands first.
     ordered = sorted(boxes, key=lambda box: (box["y1"], box["x1"]))
     bands = []
-    for box in ordered:
+    for position, box in enumerate(ordered):
+        if (position & 255) == 0 and time.perf_counter() > deadline:
+            raise SuggestTimeout()
         placed = False
         for band in bands:
             if layout._same_visual_line(
@@ -380,46 +430,90 @@ def _suggest_lines(boxes):
     return merged, vertical
 
 
-def _column_separators(boxes, low, high):
+def _column_separators(boxes, low, high, deadline=None):
     """Two x separators that split the boxes into three column clusters.
 
     Splits are restricted to gaps between the boxes' x-spans, so no box is
     ever cut by a suggested separator.  The pair that minimises within-column
     spread (with a heavy penalty for crossing a box) wins; if the boxes do not
     form three clusters, equal thirds of the page width are used.
+
+    The original implementation rescanned every box for each candidate pair
+    (O(n**3)); a 1500-box page could not finish inside the request timeout.
+    Here the within-group variance comes from centre prefix sums and the
+    crossing penalties are precomputed once per gap, giving O(n**2) while
+    producing exactly the same scores, tie handling and equal-thirds
+    fallback as before.
     """
-    spans = sorted((box["x1"], box["x2"], (box["x1"] + box["x2"]) / 2.0)
-                   for box in boxes)
-    gaps = [index for index in range(len(spans) - 1)
-            if spans[index + 1][0] - spans[index][1] > 0]
-    best = None
-    for first in gaps:
-        for second in gaps:
-            if second <= first:
-                continue
-            groups = [spans[:first + 1], spans[first + 1:second + 1], spans[second + 1:]]
-            if any(not group for group in groups):
-                continue
-            split_a = (spans[first][1] + spans[first + 1][0]) / 2.0
-            split_b = (spans[second][1] + spans[second + 1][0]) / 2.0
-            score = 0.0
-            for group in groups:
-                centre = sum(entry[2] for entry in group) / len(group)
-                score += sum((entry[2] - centre) ** 2 for entry in group)
-                for start, end, _mid in group:
-                    if start < split_a < end or start < split_b < end:
-                        score += 1e9
-            if best is None or score < best[0]:
-                best = (score, split_a, split_b)
-    if best is None:
+    if deadline is None:
+        deadline = time.perf_counter() + SUGGEST_DEADLINE_SECONDS
+
+    def equal_thirds():
         step = (high - low) / 3.0
         return [round(low + step, 2), round(low + 2 * step, 2)]
+
+    spans = sorted((box["x1"], box["x2"], (box["x1"] + box["x2"]) / 2.0)
+                   for box in boxes)
+    n = len(spans)
+    gap_after = [index for index in range(n - 1)
+                 if spans[index + 1][0] - spans[index][1] > 0]
+    # Two cuts need two distinct gaps, and every resulting group must be
+    # non-empty: fewer than two gaps cannot form three clusters.
+    if len(gap_after) < 2:
+        return equal_thirds()
+
+    # Prefix sums of cluster centres make the within-group sum of squared
+    # deviations O(1): sum((c-mean)^2) = sum(c^2) - sum(c)^2 / count.
+    centres = [entry[2] for entry in spans]
+    prefix = [0.0] * (n + 1)
+    prefix_sq = [0.0] * (n + 1)
+    for index, centre in enumerate(centres):
+        prefix[index + 1] = prefix[index] + centre
+        prefix_sq[index + 1] = prefix_sq[index] + centre * centre
+
+    def variance(start, end):
+        count = end - start + 1
+        total = prefix[end + 1] - prefix[start]
+        total_sq = prefix_sq[end + 1] - prefix_sq[start]
+        return total_sq - total * total / count
+
+    # One candidate cut per gap, together with the indices of boxes whose
+    # span the cut line crosses.  Crossing sets are computed up front instead
+    # of inside the pair loop, which removes the cubic factor.  The pair
+    # penalty counts *distinct* spans crossing either cut, matching the
+    # original ``start < split_a < end or start < split_b < end`` test
+    # (a span crossing both cuts is one violation, not two).
+    cuts = []
+    for index in gap_after:
+        split = (spans[index][1] + spans[index + 1][0]) / 2.0
+        crossed = {
+            span_index
+            for span_index, (start, end, _mid) in enumerate(spans)
+            if start < split < end
+        }
+        cuts.append((index, split, crossed))
+
+    best = None
+    for first_index, (first, split_a, cross_a) in enumerate(cuts):
+        if (first_index & 63) == 0 and time.perf_counter() > deadline:
+            raise SuggestTimeout()
+        for second, split_b, cross_b in cuts[first_index + 1:]:
+            score = (
+                variance(0, first)
+                + variance(first + 1, second)
+                + variance(second + 1, n - 1)
+                + 1e9 * len(cross_a | cross_b)
+            )
+            # Strict "<" preserves the original tie behaviour: with equal
+            # scores the first pair in sorted-gap order is kept.
+            if best is None or score < best[0]:
+                best = (score, split_a, split_b)
+
     separators = sorted({
         round(value, 2) for value in (best[1], best[2])
         if low + layout.EPS < value < high - layout.EPS
     })
     if len(separators) != 2:
-        step = (high - low) / 3.0
-        return [round(low + step, 2), round(low + 2 * step, 2)]
+        return equal_thirds()
     return separators
 
